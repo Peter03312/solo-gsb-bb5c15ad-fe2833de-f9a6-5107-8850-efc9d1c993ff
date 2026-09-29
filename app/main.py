@@ -1,0 +1,377 @@
+"""FastAPI 入口：民用日程展开服务。"""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+from fastapi import FastAPI
+
+from .models import (
+    CommonFreeSlotsRequest,
+    CommonFreeSlotsResponse,
+    DailyOccupancyRequest,
+    DailyOccupancyResponse,
+    ExpandRequest,
+    ExpandResponse,
+    FreeSlotOut,
+    HandoffLegOut,
+    HandoffRouteRequest,
+    HandoffRouteResponse,
+    OverlapRequest,
+    OverlapResponse,
+    RestViolationOut,
+    RestViolationsRequest,
+    RestViolationsResponse,
+    ScheduleChangeOut,
+    ScheduleChangesRequest,
+    ScheduleChangesResponse,
+    StaffingGapOut,
+    StaffingGapsRequest,
+    StaffingGapsResponse,
+)
+from .scheduler import (
+    common_free_slots,
+    expand_schedule,
+    find_overlaps,
+    handoff_route,
+    instance_payload,
+    occupancy_by_day,
+    rest_violations,
+    schedule_changes,
+    staffing_gaps,
+    utc_iso,
+)
+
+app = FastAPI(
+    title="Civil Schedule Expander",
+    version="1.0.0",
+    description=(
+        "基于标准库 zoneinfo 的民用日程展开 API："
+        "通过 UTC 往返校验区分正常 / 跳时 / 叠时，"
+        "按策略生成去重且按 UTC 稳定排序的实例，"
+        "并可检测两个日程在真实时间轴上的重叠、按报告时区统计逐日占用，"
+        "按 UTC 窗口扫描多员工在岗人数缺口，"
+        "检查同一员工相邻工作段之间的休息是否低于最低分钟数，"
+        "以及在 UTC 窗口内按步长网格枚举多名参与者共同空闲的预约槽，"
+        "并对账同一员工变更前后两版日程在 UTC 窗口内的取消与新增区间，"
+        "以及在多名员工的连续共同在岗期间规划消息交接的最早到达链。"
+    ),
+)
+
+
+@app.get("/health", summary="健康检查")
+def health() -> dict:
+    return {"status": "ok"}
+
+
+@app.post("/expand", response_model=ExpandResponse, summary="展开日程")
+def expand(req: ExpandRequest) -> ExpandResponse:
+    tz = ZoneInfo(req.timezone)
+    instances, skipped = expand_schedule(
+        tz=tz,
+        start_date=req.start_date,
+        end_date=req.end_date,
+        weekdays=req.weekdays,
+        local_time=req.local_time,
+        gap_strategy=req.gap_strategy.value,
+        fold_strategy=req.fold_strategy.value,
+    )
+    return ExpandResponse(
+        timezone=req.timezone,
+        count=len(instances),
+        skipped_count=len(skipped),
+        skipped_dates=[d.isoformat() for d in skipped],
+        instances=[instance_payload(i, tz) for i in instances],
+    )
+
+
+@app.post("/overlaps", response_model=OverlapResponse, summary="检测两个日程的重叠")
+def overlaps(req: OverlapRequest) -> OverlapResponse:
+    # 两侧各自按原 gap/fold 策略展开（实例已按 UTC 去重、排序）
+    expanded = []
+    for side in (req.a, req.b):
+        tz = ZoneInfo(side.timezone)
+        instances, _ = expand_schedule(
+            tz=tz,
+            start_date=side.start_date,
+            end_date=side.end_date,
+            weekdays=side.weekdays,
+            local_time=side.local_time,
+            gap_strategy=side.gap_strategy.value,
+            fold_strategy=side.fold_strategy.value,
+        )
+        expanded.append(instances)
+    found = find_overlaps(
+        a_instances=expanded[0],
+        a_duration_minutes=req.a.duration_minutes,
+        b_instances=expanded[1],
+        b_duration_minutes=req.b.duration_minutes,
+    )
+    return OverlapResponse(
+        count=len(found),
+        overlaps=[
+            {
+                "a_start_utc": utc_iso(o.a_start),
+                "b_start_utc": utc_iso(o.b_start),
+                "overlap_start_utc": utc_iso(o.start),
+                "overlap_end_utc": utc_iso(o.end),
+                "minutes": o.minutes,
+            }
+            for o in found
+        ],
+    )
+
+
+@app.post(
+    "/daily-occupancy",
+    response_model=DailyOccupancyResponse,
+    summary="按报告时区统计逐日占用分钟数",
+)
+def daily_occupancy(req: DailyOccupancyRequest) -> DailyOccupancyResponse:
+    tz = ZoneInfo(req.timezone)
+    instances, _ = expand_schedule(
+        tz=tz,
+        start_date=req.start_date,
+        end_date=req.end_date,
+        weekdays=req.weekdays,
+        local_time=req.local_time,
+        gap_strategy=req.gap_strategy.value,
+        fold_strategy=req.fold_strategy.value,
+    )
+    days = occupancy_by_day(
+        instances=instances,
+        duration_minutes=req.duration_minutes,
+        report_tz=ZoneInfo(req.report_timezone),
+    )
+    return DailyOccupancyResponse(
+        report_timezone=req.report_timezone,
+        count=len(days),
+        days=[{"date": d.isoformat(), "minutes": m} for d, m in days],
+    )
+
+
+@app.post(
+    "/staffing-gaps",
+    response_model=StaffingGapsResponse,
+    summary="查询最低在岗人数缺口",
+)
+def staffing_gaps_check(req: StaffingGapsRequest) -> StaffingGapsResponse:
+    # 每名员工的各条日程按原 gap/fold 策略展开，实例按真实时长转为半开 UTC 区间
+    employee_intervals: dict[str, list[tuple[datetime, datetime]]] = {}
+    for emp in req.employees:
+        intervals: list[tuple[datetime, datetime]] = []
+        for side in emp.schedules or []:
+            tz = ZoneInfo(side.timezone)
+            instances, _ = expand_schedule(
+                tz=tz,
+                start_date=side.start_date,
+                end_date=side.end_date,
+                weekdays=side.weekdays,
+                local_time=side.local_time,
+                gap_strategy=side.gap_strategy.value,
+                fold_strategy=side.fold_strategy.value,
+            )
+            span = timedelta(minutes=side.duration_minutes)
+            intervals.extend((i.utc, i.utc + span) for i in instances)
+        employee_intervals[emp.id] = intervals
+    gaps = staffing_gaps(
+        window_start=req.window_start_utc,
+        window_end=req.window_end_utc,
+        min_staff=req.min_staff,
+        employee_intervals=employee_intervals,
+    )
+    return StaffingGapsResponse(
+        count=len(gaps),
+        gaps=[
+            StaffingGapOut(
+                start_utc=utc_iso(g.start),
+                end_utc=utc_iso(g.end),
+                on_duty=list(g.on_duty),
+                missing=g.missing,
+            )
+            for g in gaps
+        ],
+    )
+
+
+@app.post(
+    "/rest-violations",
+    response_model=RestViolationsResponse,
+    summary="检查相邻工作段间休息不足的空档",
+)
+def rest_violations_check(req: RestViolationsRequest) -> RestViolationsResponse:
+    # 同一员工的各条日程按原 gap/fold 策略展开，实例按真实时长转为半开 UTC 区间
+    intervals: list[tuple[datetime, datetime]] = []
+    for side in req.schedules:
+        tz = ZoneInfo(side.timezone)
+        instances, _ = expand_schedule(
+            tz=tz,
+            start_date=side.start_date,
+            end_date=side.end_date,
+            weekdays=side.weekdays,
+            local_time=side.local_time,
+            gap_strategy=side.gap_strategy.value,
+            fold_strategy=side.fold_strategy.value,
+        )
+        span = timedelta(minutes=side.duration_minutes)
+        intervals.extend((i.utc, i.utc + span) for i in instances)
+    violations = rest_violations(
+        intervals=intervals, min_rest_minutes=req.min_rest_minutes
+    )
+    return RestViolationsResponse(
+        min_rest_minutes=req.min_rest_minutes,
+        count=len(violations),
+        violations=[
+            RestViolationOut(
+                start_utc=utc_iso(v.start),
+                end_utc=utc_iso(v.end),
+                rest_minutes=v.rest_minutes,
+                shortfall_minutes=req.min_rest_minutes - v.rest_minutes,
+            )
+            for v in violations
+        ],
+    )
+
+
+@app.post(
+    "/common-free-slots",
+    response_model=CommonFreeSlotsResponse,
+    summary="查询多名参与者共同空闲的预约槽",
+)
+def common_free_slots_check(req: CommonFreeSlotsRequest) -> CommonFreeSlotsResponse:
+    # 每名参与者的各条日程按原 gap/fold 策略展开，实例按真实时长转为半开 UTC 区间
+    participant_intervals: list[list[tuple[datetime, datetime]]] = []
+    for participant in req.participants:
+        intervals: list[tuple[datetime, datetime]] = []
+        for side in participant.schedules or []:
+            tz = ZoneInfo(side.timezone)
+            instances, _ = expand_schedule(
+                tz=tz,
+                start_date=side.start_date,
+                end_date=side.end_date,
+                weekdays=side.weekdays,
+                local_time=side.local_time,
+                gap_strategy=side.gap_strategy.value,
+                fold_strategy=side.fold_strategy.value,
+            )
+            span = timedelta(minutes=side.duration_minutes)
+            intervals.extend((i.utc, i.utc + span) for i in instances)
+        participant_intervals.append(intervals)
+    slots = common_free_slots(
+        window_start=req.window_start_utc,
+        window_end=req.window_end_utc,
+        duration_minutes=req.duration_minutes,
+        step_minutes=req.step_minutes,
+        participant_intervals=participant_intervals,
+    )
+    return CommonFreeSlotsResponse(
+        count=len(slots),
+        slots=[
+            FreeSlotOut(start_utc=utc_iso(start), end_utc=utc_iso(end))
+            for start, end in slots
+        ],
+    )
+
+
+@app.post(
+    "/schedule-changes",
+    response_model=ScheduleChangesResponse,
+    summary="对账同一员工变更前后的排班差异",
+)
+def schedule_changes_check(req: ScheduleChangesRequest) -> ScheduleChangesResponse:
+    # 变更前后两版日程各自按原 gap/fold 策略展开，实例按真实时长转为半开 UTC 区间
+    versions: list[list[tuple[datetime, datetime]]] = []
+    for sides in (req.before, req.after):
+        intervals: list[tuple[datetime, datetime]] = []
+        for side in sides or []:
+            tz = ZoneInfo(side.timezone)
+            instances, _ = expand_schedule(
+                tz=tz,
+                start_date=side.start_date,
+                end_date=side.end_date,
+                weekdays=side.weekdays,
+                local_time=side.local_time,
+                gap_strategy=side.gap_strategy.value,
+                fold_strategy=side.fold_strategy.value,
+            )
+            span = timedelta(minutes=side.duration_minutes)
+            intervals.extend((i.utc, i.utc + span) for i in instances)
+        versions.append(intervals)
+    cancelled, added = schedule_changes(
+        window_start=req.window_start_utc,
+        window_end=req.window_end_utc,
+        before_intervals=versions[0],
+        after_intervals=versions[1],
+    )
+
+    def _payload(
+        segments: list[tuple[datetime, datetime]],
+    ) -> list[ScheduleChangeOut]:
+        return [
+            ScheduleChangeOut(
+                start_utc=utc_iso(start),
+                end_utc=utc_iso(end),
+                minutes=(end - start).total_seconds() / 60,
+            )
+            for start, end in segments
+        ]
+
+    cancelled_out = _payload(cancelled)
+    added_out = _payload(added)
+    return ScheduleChangesResponse(
+        cancelled_count=len(cancelled_out),
+        cancelled_total_minutes=sum(c.minutes for c in cancelled_out),
+        cancelled=cancelled_out,
+        added_count=len(added_out),
+        added_total_minutes=sum(a.minutes for a in added_out),
+        added=added_out,
+    )
+
+
+@app.post(
+    "/handoff-route",
+    response_model=HandoffRouteResponse,
+    summary="规划消息经共同在岗交接到达目标的最早链",
+)
+def handoff_route_check(req: HandoffRouteRequest) -> HandoffRouteResponse:
+    # 每名员工的各条日程按原 gap/fold 策略展开，实例按真实时长转为半开 UTC 区间
+    employee_intervals: dict[str, list[tuple[datetime, datetime]]] = {}
+    for emp in req.employees:
+        intervals: list[tuple[datetime, datetime]] = []
+        for side in emp.schedules or []:
+            tz = ZoneInfo(side.timezone)
+            instances, _ = expand_schedule(
+                tz=tz,
+                start_date=side.start_date,
+                end_date=side.end_date,
+                weekdays=side.weekdays,
+                local_time=side.local_time,
+                gap_strategy=side.gap_strategy.value,
+                fold_strategy=side.fold_strategy.value,
+            )
+            span = timedelta(minutes=side.duration_minutes)
+            intervals.extend((i.utc, i.utc + span) for i in instances)
+        employee_intervals[emp.id] = intervals
+    arrival, chain = handoff_route(
+        message_at=req.message_at_utc,
+        deadline=req.deadline_utc,
+        holder=req.holder_id,
+        target=req.target_id,
+        duration_minutes=req.duration_minutes,
+        employee_intervals=employee_intervals,
+    )
+    legs = [
+        HandoffLegOut(
+            sender_id=leg.sender,
+            receiver_id=leg.receiver,
+            start_utc=utc_iso(leg.start),
+            end_utc=utc_iso(leg.end),
+        )
+        for leg in chain
+    ]
+    return HandoffRouteResponse(
+        arrival_utc=utc_iso(arrival) if arrival is not None else None,
+        count=len(legs),
+        chain=legs,
+    )
