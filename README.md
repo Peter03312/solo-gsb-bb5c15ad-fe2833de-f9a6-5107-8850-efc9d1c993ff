@@ -667,6 +667,99 @@ docker compose up --build
 - 发送者在共同在岗段开始时若尚未持有消息，交接从其实际持有的时刻起算
   （如消息产生于一段共同在岗的中间）。
 
+### `POST /allocate-batches`
+
+把订单数量按 **FEFO**（First-Expired-First-Out，失效日期早的批次先用）
+分配到库存批次：
+
+- 批次按 `expiry` 从早到晚排序，**同日按 `batch_no` 字典序**排序后依次消耗。
+- 订单按请求中的顺序逐条满足；**一个订单可拆分到多个批次**。
+- 每个订单都必须足量满足，全部订单完成后才一次性提交整批结果。
+- **任何**校验或库存问题均返回 `400` 整单拒绝，响应中不含任何部分分配。
+
+请求体：
+
+| 字段 | 说明 |
+| --- | --- |
+| `batches[].batch_no` | 批次号，非空字符串，全请求内唯一 |
+| `batches[].available` | 可用数量，正整数或正有限小数（不接受 `true`/`false`、字符串） |
+| `batches[].expiry` | 失效日期，严格 `YYYY-MM-DD`（拒绝 `2026/05/01`、`2026-5-1`、`2026-02-30`） |
+| `orders[].order_no` | 订单号，非空字符串，全请求内唯一 |
+| `orders[].quantity` | 订单数量，正数，规则同 `available` |
+
+成功 `200` 响应：
+
+- `allocations[]`：每单的分配明细（顺序与请求 `orders` 一致），
+  `lines` 为该单命中的批次及数量，按 FEFO 顺序排列；
+- `remaining[]`：各批次剩余库存（耗尽为 `0`），按失效日期、批次号排序；
+- `total_allocated`：总分配量（等于全部订单数量之和）。
+  整数值序列化为 `80` 而非 `80.0`。
+
+`400` 错误体为 `{"error": "<code>", "message": "..."}`，`error` 取值：
+
+| code | 触发条件 |
+| --- | --- |
+| `invalid_request` | 非 JSON、缺字段、字段类型错误、批次/订单为空、ID 为空 |
+| `invalid_quantity` | 数量非正、不是数值、布尔值、NaN/Infinity |
+| `invalid_date` | 失效日期格式错误或不是真实日历日 |
+| `duplicate_batch` | 批次号重复 |
+| `duplicate_order` | 订单号重复 |
+| `insufficient_stock` | 总库存不足以满足全部订单（不返回部分分配） |
+
+示例请求：
+
+```bash
+curl -s http://localhost:8000/allocate-batches \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "batches": [
+      {"batch_no": "B-003", "available": 100, "expiry": "2027-06-30"},
+      {"batch_no": "B-001", "available": 40,  "expiry": "2026-05-01"},
+      {"batch_no": "B-002", "available": 30,  "expiry": "2026-05-01"}
+    ],
+    "orders": [
+      {"order_no": "SO-1", "quantity": 80},
+      {"order_no": "SO-2", "quantity": 20}
+    ]
+  }'
+```
+
+响应：`SO-1` 先同日字典序取空 `B-001`(40)、`B-002`(30)，再从 `B-003` 取 10；
+`SO-2` 从 `B-003` 剩余 90 中取 20：
+
+```json
+{
+  "allocations": [
+    {"order_no": "SO-1", "total": 80, "lines": [
+      {"batch_no": "B-001", "quantity": 40, "expiry": "2026-05-01"},
+      {"batch_no": "B-002", "quantity": 30, "expiry": "2026-05-01"},
+      {"batch_no": "B-003", "quantity": 10, "expiry": "2027-06-30"}
+    ]},
+    {"order_no": "SO-2", "total": 20, "lines": [
+      {"batch_no": "B-003", "quantity": 20, "expiry": "2027-06-30"}
+    ]}
+  ],
+  "remaining": [
+    {"batch_no": "B-001", "expiry": "2026-05-01", "remaining": 0},
+    {"batch_no": "B-002", "expiry": "2026-05-01", "remaining": 0},
+    {"batch_no": "B-003", "expiry": "2027-06-30", "remaining": 70}
+  ],
+  "total_allocated": 100
+}
+```
+
+库存不足时整单拒绝，无部分结果：
+
+```bash
+curl -s -w ' [%{http_code}]\n' http://localhost:8000/allocate-batches \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "batches": [{"batch_no": "B-001", "available": 5, "expiry": "2026-05-01"}],
+    "orders": [{"order_no": "SO-1", "quantity": 9}]
+  }'
+# {"error":"insufficient_stock","message":"insufficient stock: demand 9 exceeds available 5"} [400]
+```
+
 ### 错误（422）
 
 以下情况返回 `422 Unprocessable Entity`：
@@ -740,9 +833,10 @@ pytest                               # 运行测试
 
 ```
 app/
-  main.py        # FastAPI 入口，/expand、/overlaps、/daily-occupancy、/staffing-gaps、/rest-violations、/common-free-slots、/schedule-changes、/handoff-route 与 /health
+  main.py        # FastAPI 入口，/expand、/overlaps、/daily-occupancy、/staffing-gaps、/rest-violations、/common-free-slots、/schedule-changes、/handoff-route、/allocate-batches 与 /health
   models.py      # 请求/响应模型与 422 校验规则
   scheduler.py   # UTC 往返校验分类 + 展开 / 去重 / 排序 + 扫描线重叠检测 + 逐日占用统计 + 在岗缺口扫描 + 休息违规检查 + 共同空闲预约槽枚举 + 排班变更集合差对账 + 共同在岗区间交集与交接链最短路
+  allocation.py  # 库存批次 FEFO 分配核心（按失效日期、批次号排序；整单原子提交；400 错误码）
 tests/           # pytest 测试（核心逻辑 + API）
 Dockerfile
 docker-compose.yml

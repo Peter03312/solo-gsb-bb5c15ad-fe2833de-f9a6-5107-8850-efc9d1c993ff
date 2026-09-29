@@ -5,9 +5,13 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
+from .allocation import AllocationError, allocate
 from .models import (
+    AllocationErrorOut,
+    AllocationResponse,
     CommonFreeSlotsRequest,
     CommonFreeSlotsResponse,
     DailyOccupancyRequest,
@@ -375,3 +379,108 @@ def handoff_route_check(req: HandoffRouteRequest) -> HandoffRouteResponse:
         count=len(legs),
         chain=legs,
     )
+
+
+_ALLOCATION_BODY_SCHEMA = {
+    "type": "object",
+    "required": ["batches", "orders"],
+    "properties": {
+        "batches": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "object",
+                "required": ["batch_no", "available", "expiry"],
+                "properties": {
+                    "batch_no": {"type": "string", "minLength": 1},
+                    "available": {"type": "number", "exclusiveMinimum": 0},
+                    "expiry": {
+                        "type": "string",
+                        "pattern": r"^\d{4}-\d{2}-\d{2}$",
+                        "description": "失效日期，YYYY-MM-DD",
+                    },
+                },
+            },
+        },
+        "orders": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "object",
+                "required": ["order_no", "quantity"],
+                "properties": {
+                    "order_no": {"type": "string", "minLength": 1},
+                    "quantity": {"type": "number", "exclusiveMinimum": 0},
+                },
+            },
+        },
+    },
+}
+
+
+@app.post(
+    "/allocate-batches",
+    response_model=AllocationResponse,
+    summary="按 FEFO（失效日期优先）把订单数量分配到库存批次",
+    responses={400: {"model": AllocationErrorOut, "description": "请求被拒绝，不返回任何部分分配"}},
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/json": {
+                    "schema": _ALLOCATION_BODY_SCHEMA,
+                    "examples": {
+                        "ok": {
+                            "summary": "正常分配：订单拆到多个批次",
+                            "value": {
+                                "batches": [
+                                    {"batch_no": "B-003", "available": 100, "expiry": "2027-06-30"},
+                                    {"batch_no": "B-001", "available": 40, "expiry": "2026-05-01"},
+                                    {"batch_no": "B-002", "available": 30, "expiry": "2026-05-01"},
+                                ],
+                                "orders": [
+                                    {"order_no": "SO-1", "quantity": 80},
+                                    {"order_no": "SO-2", "quantity": 20},
+                                ],
+                            },
+                        },
+                        "insufficient": {
+                            "summary": "库存不足：整单被拒绝（400）",
+                            "value": {
+                                "batches": [
+                                    {"batch_no": "B-001", "available": 5, "expiry": "2026-05-01"}
+                                ],
+                                "orders": [{"order_no": "SO-1", "quantity": 9}],
+                            },
+                        },
+                    },
+                }
+            },
+        }
+    },
+)
+async def allocate_batches(request: Request) -> AllocationResponse | JSONResponse:
+    """按失效日期从早到晚（同日按批次号字典序）依次消耗库存。
+
+    - 订单按请求顺序逐条足额满足，一个订单可拆分到多个批次。
+    - 库存不足、数量非正、批次号重复、日期格式错误等情况一律 400 拒绝，
+      不返回任何部分分配。
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "invalid_request",
+                "message": "request body must be valid JSON",
+            },
+        )
+    try:
+        result = allocate(payload)
+    except AllocationError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={"error": exc.code, "message": exc.message},
+        )
+    return AllocationResponse(**result)

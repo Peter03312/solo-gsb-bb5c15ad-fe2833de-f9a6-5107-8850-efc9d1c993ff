@@ -11,7 +11,13 @@ from enum import Enum
 from typing import Annotated
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    PlainSerializer,
+    field_validator,
+    model_validator,
+)
 
 MAX_RANGE_DAYS = 366
 
@@ -464,3 +470,54 @@ class HandoffRouteResponse(BaseModel):
     chain: list[HandoffLegOut] = Field(
         ..., description="依次进行的交接（双方 ID 与 UTC 起止）；无解或初始即目标时为空"
     )
+
+
+def _serialize_quantity(v: float) -> float | int:
+    """整数值数量输出为 int（80 而非 80.0），非整数原样保留。"""
+    return int(v) if float(v).is_integer() else v
+
+
+Quantity = Annotated[float, PlainSerializer(_serialize_quantity)]
+
+
+class AllocationLineOut(BaseModel):
+    batch_no: str = Field(..., description="命中批次号")
+    quantity: Quantity = Field(..., description="从该批次分配的数量（正数）")
+    expiry: str = Field(..., description="该批次失效日期，YYYY-MM-DD")
+
+
+class OrderAllocationOut(BaseModel):
+    order_no: str = Field(..., description="订单号")
+    total: Quantity = Field(..., description="订单请求总量（已足额满足）")
+    lines: list[AllocationLineOut] = Field(
+        ..., description="按 FEFO 顺序命中的批次明细，至少一条"
+    )
+
+
+class BatchRemainingOut(BaseModel):
+    batch_no: str = Field(..., description="批次号")
+    expiry: str = Field(..., description="失效日期，YYYY-MM-DD")
+    remaining: Quantity = Field(..., description="该批次剩余可用数量；耗尽为 0")
+
+
+class AllocationResponse(BaseModel):
+    allocations: list[OrderAllocationOut] = Field(
+        ..., description="每单分配明细，顺序与请求 orders 一致"
+    )
+    remaining: list[BatchRemainingOut] = Field(
+        ..., description="各批次剩余库存，按失效日期、批次号排序"
+    )
+    total_allocated: Quantity = Field(
+        ..., description="总分配量（等于全部订单数量之和）"
+    )
+
+
+class AllocationErrorOut(BaseModel):
+    error: str = Field(
+        ...,
+        description=(
+            "机器可读错误码：invalid_request / invalid_quantity / "
+            "invalid_date / duplicate_batch / duplicate_order / insufficient_stock"
+        ),
+    )
+    message: str = Field(..., description="面向调用方的错误说明")
