@@ -2288,3 +2288,240 @@ def test_handoff_route_reuses_schedule_validation():
         ),
     )
     assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# /inventory-allocation：FEFO 库存批次分配
+# ---------------------------------------------------------------------------
+
+_INV_BASE_BATCHES = [
+    {"batch_no": "B9", "available_quantity": 100, "expiry_date": "2026-06-01"},
+    {"batch_no": "B10", "available_quantity": 3, "expiry_date": "2026-03-01"},
+    {"batch_no": "B02", "available_quantity": 5, "expiry_date": "2026-03-01"},
+    {"batch_no": "B01", "available_quantity": 7, "expiry_date": "2026-01-01"},
+]
+
+
+def _inv_payload(orders, batches=_INV_BASE_BATCHES):
+    return {"batches": batches, "orders": orders}
+
+
+def test_inventory_allocation_fefo_split_and_remaining():
+    resp = client.post(
+        "/inventory-allocation",
+        json=_inv_payload([{"order_id": "O1", "quantity": 10}]),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total_allocated"] == 10
+    assert body["allocations"] == [
+        {
+            "order_id": "O1",
+            "quantity": 10,
+            "lines": [
+                {"batch_no": "B01", "expiry_date": "2026-01-01", "quantity": 7},
+                {"batch_no": "B02", "expiry_date": "2026-03-01", "quantity": 3},
+            ],
+        }
+    ]
+    # 剩余库存按 FEFO 顺序返回
+    assert [(r["batch_no"], r["remaining"]) for r in body["remaining_stock"]] == [
+        ("B01", 0),
+        ("B02", 2),
+        ("B10", 3),
+        ("B9", 100),
+    ]
+    b01 = next(r for r in body["remaining_stock"] if r["batch_no"] == "B01")
+    assert b01["available_before"] == 7
+
+
+def test_inventory_allocation_multiple_orders_share_stock():
+    resp = client.post(
+        "/inventory-allocation",
+        json=_inv_payload(
+            [
+                {"order_id": "O1", "quantity": 8},
+                {"order_id": "O2", "quantity": 7},
+            ]
+        ),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total_allocated"] == 15
+    assert [
+        (l["batch_no"], l["quantity"]) for l in body["allocations"][0]["lines"]
+    ] == [("B01", 7), ("B02", 1)]
+    assert [
+        (l["batch_no"], l["quantity"]) for l in body["allocations"][1]["lines"]
+    ] == [("B02", 4), ("B10", 3)]
+
+
+def test_inventory_allocation_decimal_quantities():
+    resp = client.post(
+        "/inventory-allocation",
+        json={
+            "batches": [
+                {"batch_no": "A", "available_quantity": "2.5", "expiry_date": "2026-01-01"},
+                {"batch_no": "B", "available_quantity": "3.25", "expiry_date": "2026-02-01"},
+            ],
+            "orders": [{"order_id": "O1", "quantity": "5.75"}],
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [
+        (l["batch_no"], l["quantity"]) for l in body["allocations"][0]["lines"]
+    ] == [("A", 2.5), ("B", 3.25)]
+    assert body["total_allocated"] == 5.75
+
+
+def test_inventory_allocation_insufficient_stock_409_no_partial_result():
+    resp = client.post(
+        "/inventory-allocation",
+        json=_inv_payload(
+            [
+                {"order_id": "O1", "quantity": 10},
+                {"order_id": "O2", "quantity": 1000},
+            ]
+        ),
+    )
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail == {
+        "error": "insufficient_stock",
+        "order_id": "O2",
+        "requested": 1000,
+        "shortfall": 895,
+        "total_available": 115,
+    }
+    # 不返回任何部分分配字段
+    assert "allocations" not in resp.json()
+    assert "remaining_stock" not in resp.json()
+
+
+def test_inventory_allocation_first_order_insufficient_409():
+    resp = client.post(
+        "/inventory-allocation",
+        json=_inv_payload([{"order_id": "O1", "quantity": 1000}]),
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["order_id"] == "O1"
+    assert resp.json()["detail"]["shortfall"] == 885
+
+
+def test_inventory_allocation_non_positive_quantity_422():
+    for bad in (0, -1, "-0.01"):
+        resp = client.post(
+            "/inventory-allocation",
+            json=_inv_payload(
+                [{"order_id": "O1", "quantity": 10}],
+                batches=[
+                    {"batch_no": "A", "available_quantity": bad, "expiry_date": "2026-01-01"}
+                ],
+            ),
+        )
+        assert resp.status_code == 422, bad
+
+    resp = client.post(
+        "/inventory-allocation",
+        json={
+            "batches": [
+                {"batch_no": "A", "available_quantity": 5, "expiry_date": "2026-01-01"}
+            ],
+            "orders": [{"order_id": "O1", "quantity": 0}],
+        },
+    )
+    assert resp.status_code == 422
+
+
+def test_inventory_allocation_duplicate_batch_no_422():
+    resp = client.post(
+        "/inventory-allocation",
+        json={
+            "batches": [
+                {"batch_no": "A", "available_quantity": 5, "expiry_date": "2026-01-01"},
+                {"batch_no": "A", "available_quantity": 3, "expiry_date": "2026-02-01"},
+            ],
+            "orders": [{"order_id": "O1", "quantity": 1}],
+        },
+    )
+    assert resp.status_code == 422
+
+
+def test_inventory_allocation_duplicate_order_id_422():
+    resp = client.post(
+        "/inventory-allocation",
+        json={
+            "batches": [
+                {"batch_no": "A", "available_quantity": 5, "expiry_date": "2026-01-01"}
+            ],
+            "orders": [
+                {"order_id": "O1", "quantity": 1},
+                {"order_id": "O1", "quantity": 1},
+            ],
+        },
+    )
+    assert resp.status_code == 422
+
+
+def test_inventory_allocation_bad_date_format_422():
+    for bad in ("2026/01/01", "01-01-2026", "2026-1-1", "20260101", "not-a-date", "2026-02-30"):
+        resp = client.post(
+            "/inventory-allocation",
+            json={
+                "batches": [
+                    {"batch_no": "A", "available_quantity": 5, "expiry_date": bad}
+                ],
+                "orders": [{"order_id": "O1", "quantity": 1}],
+            },
+        )
+        assert resp.status_code == 422, bad
+
+
+def test_inventory_allocation_empty_lists_and_missing_fields_422():
+    resp = client.post("/inventory-allocation", json={"batches": [], "orders": []})
+    assert resp.status_code == 422
+
+    resp = client.post(
+        "/inventory-allocation",
+        json={
+            "batches": [
+                {"batch_no": "   ", "available_quantity": 5, "expiry_date": "2026-01-01"}
+            ],
+            "orders": [{"order_id": "O1", "quantity": 1}],
+        },
+    )
+    assert resp.status_code == 422
+
+    resp = client.post("/inventory-allocation", json={})
+    assert resp.status_code == 422
+
+
+def test_inventory_allocation_non_numeric_quantity_422():
+    resp = client.post(
+        "/inventory-allocation",
+        json={
+            "batches": [
+                {"batch_no": "A", "available_quantity": "abc", "expiry_date": "2026-01-01"}
+            ],
+            "orders": [{"order_id": "O1", "quantity": 1}],
+        },
+    )
+    assert resp.status_code == 422
+
+
+def test_inventory_allocation_non_finite_quantity_422():
+    # NaN / Infinity 不是合法 JSON 数字；以非标准 token 发送时服务端解析亦拒绝
+    for token in ("NaN", "Infinity", "-Infinity", "1e9999"):
+        raw = (
+            '{"batches": [{"batch_no": "A", "available_quantity": '
+            + token
+            + ', "expiry_date": "2026-01-01"}], '
+            '"orders": [{"order_id": "O1", "quantity": 1}]}'
+        )
+        resp = client.post(
+            "/inventory-allocation",
+            content=raw,
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code == 422, token

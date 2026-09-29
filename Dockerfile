@@ -11,10 +11,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
-# 构建期初始化自检：应用（含 /handoff-route 等全部路由）可正常导入，
-# tzdata 时区库可用；失败则镜像构建失败，避免带病镜像启动
+# 构建期初始化自检：应用（含 /handoff-route、/inventory-allocation 等全部路由）
+# 可正常导入，tzdata 时区库可用；失败则镜像构建失败，避免带病镜像启动
 RUN python -c "from app.main import app; \
-assert any(getattr(r, 'path', '') == '/handoff-route' for r in app.routes); \
+paths = {getattr(r, 'path', '') for r in app.routes}; \
+assert '/handoff-route' in paths and '/inventory-allocation' in paths; \
 from zoneinfo import ZoneInfo; ZoneInfo('UTC')"
 
 EXPOSE 8000

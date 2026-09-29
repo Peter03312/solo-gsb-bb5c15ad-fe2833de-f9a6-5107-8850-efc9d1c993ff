@@ -19,6 +19,9 @@ UTC 时间与决策原因。`POST /overlaps` 在此基础上为两个日程各�
 相交或相接者，在**任意两人的连续共同在岗**约束下，求消息经若干次交接
 到达目标员工的**最早时刻与一条交接链**，交接期间发送者须已持有消息，
 持有期间离岗不丢失消息。
+此外 `POST /inventory-allocation` 提供仓储 FEFO 批次分配：
+按失效日期（同日按批次号字典序）把订单数量拆分配到库存批次，
+全部订单足量满足才整批提交，库存不足时整批拒绝且不返回部分分配。
 
 ## 快速启动（单条命令）
 
@@ -33,7 +36,7 @@ docker compose up --build
 - 服务地址： http://localhost:8000
 - 交互式文档（Swagger UI）： http://localhost:8000/docs
 - 健康检查： http://localhost:8000/health
-- 接口（均为 POST，端口同上）： `/expand`、`/overlaps`、`/daily-occupancy`、`/staffing-gaps`、`/rest-violations`、`/common-free-slots`、`/schedule-changes`、`/handoff-route`
+- 接口（均为 POST，端口同上）： `/expand`、`/overlaps`、`/daily-occupancy`、`/staffing-gaps`、`/rest-violations`、`/common-free-slots`、`/schedule-changes`、`/handoff-route`、`/inventory-allocation`
 
 ## 配置
 
@@ -667,6 +670,101 @@ docker compose up --build
 - 发送者在共同在岗段开始时若尚未持有消息，交接从其实际持有的时刻起算
   （如消息产生于一段共同在岗的中间）。
 
+### `POST /inventory-allocation`
+
+仓储人员把订单数量分配到库存批次：按 **FEFO（先到期先出）** 依次扣减——批次按
+`expiry_date` 从早到晚排序，**同日按 `batch_no` Unicode 字典序**排序；订单按
+输入顺序逐条满足，**允许一条订单拆分到多个批次**。只有当**全部订单都能足量
+满足**时才整批提交返回；任一订单库存不足则整批拒绝（`409`），**不返回任何
+部分分配**。数量用十进制精确运算，支持整数与小数（如 `5`、`"2.5"`）。
+
+请求体：
+
+```json
+{
+  "batches": [
+    {"batch_no": "B01", "available_quantity": 7,    "expiry_date": "2026-01-01"},
+    {"batch_no": "B02", "available_quantity": 5.5,  "expiry_date": "2026-03-01"},
+    {"batch_no": "B10", "available_quantity": 3,    "expiry_date": "2026-03-01"},
+    {"batch_no": "B9",  "available_quantity": 100,  "expiry_date": "2026-06-01"}
+  ],
+  "orders": [
+    {"order_id": "SO-1001", "quantity": 10},
+    {"order_id": "SO-1002", "quantity": 5.5}
+  ]
+}
+```
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `batches` | object[] | 库存批次，至少 1 个；`batch_no` 在请求内唯一、非空 |
+| `batches[].batch_no` | string | 批次号（去除首尾空白后非空且唯一） |
+| `batches[].available_quantity` | number \| string | 可用数量，**必须为正数**，整数或十进制小数 |
+| `batches[].expiry_date` | string | 失效日期，严格 `YYYY-MM-DD`（ISO 8601） |
+| `orders` | object[] | 订单明细，至少 1 条；`order_id` 在请求内唯一、非空 |
+| `orders[].order_id` | string | 订单号（去除首尾空白后非空且唯一） |
+| `orders[].quantity` | number \| string | 订单需求数量，**必须为正数**，整数或十进制小数 |
+
+响应 `200`：
+
+```json
+{
+  "allocations": [
+    {
+      "order_id": "SO-1001",
+      "quantity": 10,
+      "lines": [
+        {"batch_no": "B01", "expiry_date": "2026-01-01", "quantity": 7},
+        {"batch_no": "B02", "expiry_date": "2026-03-01", "quantity": 3}
+      ]
+    },
+    {
+      "order_id": "SO-1002",
+      "quantity": 5.5,
+      "lines": [
+        {"batch_no": "B02", "expiry_date": "2026-03-01", "quantity": 2.5},
+        {"batch_no": "B10", "expiry_date": "2026-03-01", "quantity": 3}
+      ]
+    }
+  ],
+  "remaining_stock": [
+    {"batch_no": "B01", "expiry_date": "2026-01-01", "available_before": 7,   "remaining": 0},
+    {"batch_no": "B02", "expiry_date": "2026-03-01", "available_before": 5.5, "remaining": 0},
+    {"batch_no": "B10", "expiry_date": "2026-03-01", "available_before": 3,   "remaining": 0},
+    {"batch_no": "B9",  "expiry_date": "2026-06-01", "available_before": 100, "remaining": 100}
+  ],
+  "total_allocated": 15.5
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `allocations[]` | 每条订单的分配结果，按订单输入顺序返回 |
+| `allocations[].quantity` | 订单原始需求数量；`lines` 中各 `quantity` 之和与其相等 |
+| `allocations[].lines[]` | 按 FEFO 取用顺序排列的批次明细（一条订单可跨多个批次，数量为 0 的批次不会出现） |
+| `remaining_stock[]` | 各批次分配前/后数量，按失效日期、批次号（FEFO 顺序）排序 |
+| `remaining_stock[].available_before` / `remaining` | 分配前可用量 / 分配后剩余量 |
+| `total_allocated` | 总分配量（全部订单需求量之和） |
+
+库存不足时返回 `409 Conflict`，响应体指出第一条无法足量满足的订单及缺口，
+且不含任何分配结果（整批原子拒绝）：
+
+```json
+{
+  "detail": {
+    "error": "insufficient_stock",
+    "order_id": "SO-1001",
+    "requested": 10,
+    "shortfall": 3,
+    "total_available": 7
+  }
+}
+```
+
+`shortfall` 为该订单在当时剩余库存下仍缺少的数量，`total_available` 为本次请求
+全部批次的可用量合计。输入校验失败（数量非正、批次号 / 订单号重复或为空、
+日期格式错误、列表为空等）统一返回 `422`，详见下节。
+
 ### 错误（422）
 
 以下情况返回 `422 Unprocessable Entity`：
@@ -692,6 +790,10 @@ docker compose up --build
   引用不存在的员工，或任一员工的日程字段校验失败
   （规则与 `/overlaps` 单侧一致）。窗口内无法在截止前交接至目标不是
   非法输入，返回 `200` 且 `arrival_utc` 为 `null`
+- `/inventory-allocation`：`batches` / `orders` 为空或缺失、批次量或订单量
+  非正（≤ 0、`NaN` / `Infinity`）或不是数字、批次号 / 订单号为空白或重复、
+  `expiry_date` 不是严格 `YYYY-MM-DD`（如 `2026/01/01`、`2026-02-30`）。
+  库存不足不是 422 而是 `409`，整批拒绝且不返回部分分配
 
 ## curl 请求示例
 
@@ -718,6 +820,21 @@ curl -s http://localhost:8000/handoff-route \
         "timezone": "UTC", "start_date": "2026-03-02", "end_date": "2026-03-02",
         "weekdays": [0], "local_time": "11:00", "duration_minutes": 120}]}
     ]'
+
+# /inventory-allocation：FEFO 分配，SO-1001 拆到 B01+B02，SO-1002 再用 B02+B10
+curl -s http://localhost:8000/inventory-allocation \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "batches": [
+      {"batch_no": "B01", "available_quantity": 7,   "expiry_date": "2026-01-01"},
+      {"batch_no": "B02", "available_quantity": 5.5, "expiry_date": "2026-03-01"},
+      {"batch_no": "B10", "available_quantity": 3,   "expiry_date": "2026-03-01"},
+      {"batch_no": "B9",  "available_quantity": 100, "expiry_date": "2026-06-01"}
+    ],
+    "orders": [
+      {"order_id": "SO-1001", "quantity": 10},
+      {"order_id": "SO-1002", "quantity": 5.5}
+    ]}'
 ```
 
 ## 判定原理
@@ -727,6 +844,12 @@ curl -s http://localhost:8000/handoff-route \
 均有效但 UTC 不同为叠时；均无效为跳时，跳变差值取两种解释对应的 UTC 之差，
 `shift_forward` 即将本地时刻加上该差值后重新校验。所有实例按 UTC 去重
 （保留先出现者）并按 UTC 稳定排序。
+
+库存分配（`/inventory-allocation`）把批次按 `(失效日期, 批次号)` 稳定排序后，
+按订单输入顺序逐条贪心扣减：每条订单依次从当前尚有库存的最早批次取用
+`min(需求量, 批次剩余)`，直到该单需求归零；任一订单遍历完批次后仍有缺口，
+则整体判定失败、丢弃全部模拟扣减（不写入、不返回部分结果）。数量全程以
+`Decimal` 运算，避免浮点误差。
 
 ## 本地开发（不用 Docker）
 
@@ -740,9 +863,10 @@ pytest                               # 运行测试
 
 ```
 app/
-  main.py        # FastAPI 入口，/expand、/overlaps、/daily-occupancy、/staffing-gaps、/rest-violations、/common-free-slots、/schedule-changes、/handoff-route 与 /health
+  main.py        # FastAPI 入口，/expand、/overlaps、/daily-occupancy、/staffing-gaps、/rest-violations、/common-free-slots、/schedule-changes、/handoff-route、/inventory-allocation 与 /health
   models.py      # 请求/响应模型与 422 校验规则
   scheduler.py   # UTC 往返校验分类 + 展开 / 去重 / 排序 + 扫描线重叠检测 + 逐日占用统计 + 在岗缺口扫描 + 休息违规检查 + 共同空闲预约槽枚举 + 排班变更集合差对账 + 共同在岗区间交集与交接链最短路
+  inventory.py   # FEFO 批次分配：按 (失效日期, 批次号) 贪心扣减 + 库存不足整批拒绝
 tests/           # pytest 测试（核心逻辑 + API）
 Dockerfile
 docker-compose.yml

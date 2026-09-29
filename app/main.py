@@ -2,12 +2,22 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI
+import math
 
+from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+
+from .inventory import BatchInput, InsufficientStock, OrderInput, allocate
 from .models import (
+    AllocateInventoryRequest,
+    AllocateInventoryResponse,
+    AllocationLineOut,
+    BatchRemainingOut,
     CommonFreeSlotsRequest,
     CommonFreeSlotsResponse,
     DailyOccupancyRequest,
@@ -18,6 +28,7 @@ from .models import (
     HandoffLegOut,
     HandoffRouteRequest,
     HandoffRouteResponse,
+    OrderAllocationOut,
     OverlapRequest,
     OverlapResponse,
     RestViolationOut,
@@ -58,6 +69,22 @@ app = FastAPI(
         "以及在多名员工的连续共同在岗期间规划消息交接的最早到达链。"
     ),
 )
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_error_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    # Pydantic 拒绝 NaN/Infinity 时会把非有限浮点原样放进 error["input"]，
+    # json.dumps 默认无法序列化它们，这里替换为字符串以保证 422 正常返回
+    detail = exc.errors()
+    for err in detail:
+        value = err.get("input")
+        if isinstance(value, float) and not math.isfinite(value):
+            err["input"] = str(value)
+    return JSONResponse(
+        status_code=422, content={"detail": jsonable_encoder(detail)}
+    )
 
 
 @app.get("/health", summary="健康检查")
@@ -374,4 +401,58 @@ def handoff_route_check(req: HandoffRouteRequest) -> HandoffRouteResponse:
         arrival_utc=utc_iso(arrival) if arrival is not None else None,
         count=len(legs),
         chain=legs,
+    )
+
+
+@app.post(
+    "/inventory-allocation",
+    response_model=AllocateInventoryResponse,
+    summary="按 FEFO 把订单数量分配到库存批次",
+)
+def inventory_allocation(req: AllocateInventoryRequest) -> AllocateInventoryResponse:
+    # 数量用 Decimal 精确运算；FEFO 排序与订单满足由纯逻辑的模块完成
+    try:
+        allocations, remaining_rows, total_allocated = allocate(
+            batches=[
+                BatchInput(
+                    batch_no=b.batch_no,
+                    available_quantity=b.available_quantity,
+                    expiry_date=date.fromisoformat(b.expiry_date),
+                )
+                for b in req.batches
+            ],
+            orders=[
+                OrderInput(order_id=o.order_id, quantity=o.quantity)
+                for o in req.orders
+            ],
+        )
+    except InsufficientStock as exc:
+        # 库存不足：整批拒绝（409），不返回任何部分分配
+        return JSONResponse(status_code=409, content={"detail": exc.detail()})
+    return AllocateInventoryResponse(
+        allocations=[
+            OrderAllocationOut(
+                order_id=a.order_id,
+                quantity=a.quantity,
+                lines=[
+                    AllocationLineOut(
+                        batch_no=line.batch_no,
+                        expiry_date=line.expiry_date.isoformat(),
+                        quantity=line.quantity,
+                    )
+                    for line in a.lines
+                ],
+            )
+            for a in allocations
+        ],
+        remaining_stock=[
+            BatchRemainingOut(
+                batch_no=row.batch_no,
+                expiry_date=row.expiry_date.isoformat(),
+                available_before=row.available_before,
+                remaining=row.remaining,
+            )
+            for row in remaining_rows
+        ],
+        total_allocated=total_allocated,
     )

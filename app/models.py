@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta, timezone
+from decimal import Decimal
 from enum import Enum
 from typing import Annotated
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -464,3 +465,150 @@ class HandoffRouteResponse(BaseModel):
     chain: list[HandoffLegOut] = Field(
         ..., description="依次进行的交接（双方 ID 与 UTC 起止）；无解或初始即目标时为空"
     )
+
+
+# ---------------------------------------------------------------------------
+# 库存批次 FEFO 分配
+# ---------------------------------------------------------------------------
+
+
+class BatchIn(BaseModel):
+    batch_no: str = Field(..., min_length=1, description="批次号，非空，请求内唯一")
+    available_quantity: Decimal = Field(
+        ..., description="可用数量，必须为正数；整数或十进制小数（如 12、2.5）"
+    )
+    expiry_date: str = Field(
+        ..., description="失效日期，严格 YYYY-MM-DD（ISO 8601）"
+    )
+
+    @field_validator("batch_no")
+    @classmethod
+    def _strip_batch_no(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("batch_no must not be empty or whitespace")
+        return v
+
+    @field_validator("available_quantity")
+    @classmethod
+    def _positive_finite(cls, v: Decimal) -> Decimal:
+        if not v.is_finite():
+            raise ValueError("available_quantity must be a finite number")
+        if v <= 0:
+            raise ValueError("available_quantity must be greater than 0")
+        return v
+
+    @field_validator("expiry_date")
+    @classmethod
+    def _strict_date(cls, v: str) -> str:
+        try:
+            parsed = date.fromisoformat(v)
+        except ValueError:
+            raise ValueError(
+                f"invalid expiry_date {v!r}: expected YYYY-MM-DD"
+            ) from None
+        # date.fromisoformat 在新版本会接受部分宽松写法，严格只允许 YYYY-MM-DD
+        if parsed.isoformat() != v:
+            raise ValueError(
+                f"invalid expiry_date {v!r}: expected YYYY-MM-DD"
+            )
+        return v
+
+
+class OrderLineIn(BaseModel):
+    order_id: str = Field(..., min_length=1, description="订单号，非空，请求内唯一")
+    quantity: Decimal = Field(
+        ..., description="订单需求数量，必须为正数；整数或十进制小数"
+    )
+
+    @field_validator("order_id")
+    @classmethod
+    def _strip_order_id(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("order_id must not be empty or whitespace")
+        return v
+
+    @field_validator("quantity")
+    @classmethod
+    def _positive_finite(cls, v: Decimal) -> Decimal:
+        if not v.is_finite():
+            raise ValueError("quantity must be a finite number")
+        if v <= 0:
+            raise ValueError("quantity must be greater than 0")
+        return v
+
+
+class AllocateInventoryRequest(BaseModel):
+    batches: list[BatchIn] = Field(
+        ..., min_length=1, description="库存批次，至少 1 个；批次号不得重复"
+    )
+    orders: list[OrderLineIn] = Field(
+        ..., min_length=1, description="订单明细，至少 1 条；订单号不得重复"
+    )
+
+    @model_validator(mode="after")
+    def _unique_ids(self) -> "AllocateInventoryRequest":
+        batch_ids = [b.batch_no.strip() for b in self.batches]
+        if len(set(batch_ids)) != len(batch_ids):
+            raise ValueError("batch_no values must be unique")
+        order_ids = [o.order_id.strip() for o in self.orders]
+        if len(set(order_ids)) != len(order_ids):
+            raise ValueError("order_id values must be unique")
+        return self
+
+
+def _quantity_number(v: Decimal) -> int | float:
+    """响应中的 Decimal 数量：整数值输出 int，否则输出 float。"""
+    return int(v) if v == v.to_integral_value() else float(v)
+
+
+class AllocationLineOut(BaseModel):
+    batch_no: str
+    expiry_date: str
+    quantity: int | float
+
+    @field_validator("quantity", mode="before")
+    @classmethod
+    def _coerce(cls, v: object) -> object:
+        return _quantity_number(v) if isinstance(v, Decimal) else v
+
+
+class OrderAllocationOut(BaseModel):
+    order_id: str
+    quantity: int | float = Field(..., description="订单原始需求数量")
+    lines: list[AllocationLineOut] = Field(
+        ..., description="按 FEFO 取用顺序排列的分配明细（可能跨多个批次）"
+    )
+
+    @field_validator("quantity", mode="before")
+    @classmethod
+    def _coerce(cls, v: object) -> object:
+        return _quantity_number(v) if isinstance(v, Decimal) else v
+
+
+class BatchRemainingOut(BaseModel):
+    batch_no: str
+    expiry_date: str
+    available_before: int | float = Field(..., description="分配前可用量")
+    remaining: int | float = Field(..., description="分配后剩余量")
+
+    @field_validator("available_before", "remaining", mode="before")
+    @classmethod
+    def _coerce(cls, v: object) -> object:
+        return _quantity_number(v) if isinstance(v, Decimal) else v
+
+
+class AllocateInventoryResponse(BaseModel):
+    allocations: list[OrderAllocationOut] = Field(
+        ..., description="每条订单的分配明细，按输入顺序返回"
+    )
+    remaining_stock: list[BatchRemainingOut] = Field(
+        ..., description="各批次分配前/后数量，按失效日期、批次号（FEFO）排序"
+    )
+    total_allocated: int | float = Field(..., description="总分配量")
+
+    @field_validator("total_allocated", mode="before")
+    @classmethod
+    def _coerce(cls, v: object) -> object:
+        return _quantity_number(v) if isinstance(v, Decimal) else v
